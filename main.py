@@ -43,6 +43,17 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def set_model_distributed(args, model):
+    # Distributed training (should be after apex fp16 initialization)
+    if args.local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=True,
+        )
+    return model
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     # data args
@@ -53,9 +64,12 @@ def parse_args():
         "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
     )
     parser.add_argument(
+        "--predict_file", type=str, default=None, help="A csv or a json file containing the predict data."
+    )
+    parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=128,
+        default=512,
         help=(
             "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
             " sequences shorter will be padded if `--pad_to_max_lengh` is passed."
@@ -141,7 +155,7 @@ def parse_args():
         "--warmup", type=float, default=0.05, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--save_steps", type=int)
+    parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--debug",
@@ -164,6 +178,27 @@ def parse_args():
         "--log_steps",
         type=int,
         default=100,
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help="after how many steps to evaluation on dev set. None for no evaluation"
+    )
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="whether to train the model"
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="whehter to evaluation the model"
+    )
+    parser.add_argument(
+        "--predict",
+        type="store_true",
+        help="whehter to predict on test dataset."
     )
     args = parser.parse_args()
     if args.output_dir is not None:
@@ -210,13 +245,7 @@ def train(args, model, train_data, dev_data, device):
         if args.tensorboard_dir is not None:
             tb_writer = SummaryWriter(args.tensorboard_dir, purge_step=purge_step)
     # Distributed training (should be after apex fp16 initialization)
-    if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            find_unused_parameters=True,
-        )
+    model = set_model_distributed(args, model)
     # Metrics
     metric = load_metric("accuracy")
     # Train!
@@ -275,8 +304,15 @@ def train(args, model, train_data, dev_data, device):
                     progress_bar.set_description("Train loss: {:.4f}".format(log_loss))
                 log_loss = 0.0
                 accumulate_step = 0
+                if args.eval_steps is not None and completed_steps % args.eval_steps == 0:
+                    # evaluation during train
+                    loss, eval_metric = evaluation(args, model, dev_data, device, metric)
+                    if args.local_rank in [-1, 0]:
+                        # only main process can log
+                        tb_writer.add_scalar('loss/Eval', loss, completed_steps)
+                        # TODO: add metric log
                 if args.local_rank in [-1, 0] and args.save_steps is not None and completed_steps % args.save_steps == 0:
-                    # save the model
+                    # save the model on main process
                     output_dir = os.path.join(args.output_dir, "checkpoint-{:d}".format(completed_steps))
                     if not os.path.exists(output_dir):
                         os.mkdir(output_dir)
@@ -284,13 +320,18 @@ def train(args, model, train_data, dev_data, device):
 
             if completed_steps >= args.max_train_steps:
                 break
+    loss, eval_metric = evaluation(args, model, dev_data, device, metric)
     if args.local_rank in [-1, 0]:
-        # save the model
+        # only main process can log
+        tb_writer.add_scalar('loss/Eval', loss, completed_steps)
+        # TODO: add metric log
+    if args.local_rank in [-1, 0]:
+        # save the model on main process
         output_dir = os.path.join(args.output_dir, "checkpoint-{:d}".format(completed_steps))
         if not os.path.exists(output_dir):
             os.mkdir(output_dir)
         save_model(model, optimizer, lr_scheduler, output_dir, epoch, completed_steps, args.max_train_steps)
-    # TODO: Evaluation
+    return completed_steps
 
 def evaluation(args, model, dev_data, device, metric):
     """evlaluation on dev data or test data"""
@@ -333,7 +374,7 @@ def evaluation(args, model, dev_data, device, metric):
     loss = np.mean(losses)
     if args.local_rank in [-1, 0]:
         eval_metric = metric.compute()
-        logger.info(f"Evaluation:  loss {loss} {eval_metric}")
+        logger.info(f"Evaluation on {len(dev_data)} examples:  loss {loss} {eval_metric}")
     model.train()  # to trian mode
     if args.local_rank != -1:
         # synchronize
@@ -463,4 +504,16 @@ if __name__=="__main__":
     if args.local_rank == 0:
         torch.distributed.barrier()
     model.to(device)
+    if args.train:
+        total_steps = train(args, model, train_data, dev_data, device)
+    if args.eval and not args.train:
+        # only evaluation without train
+        model = set_model_distributed(args, model)
+        metric = load_metric("accuracy")
+        loss, eval_metric = evaluation(args, model, dev_data, device, metric)
+    if args.predict:
+        if args.local_rank in [-1, 0]:
+            # get model on single gpu
+            model = model.module if hasattr(model, "module") else model
+            predictions = predict(args, model, test_data， device)
     

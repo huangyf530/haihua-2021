@@ -5,6 +5,13 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 
+def length_clip(content, query, option):
+    content = content.replace("\n", "\\n")
+    query = query.replace("\n", "\\n")
+    option = option.replace("\n", "\\n")
+    return content[:383], query[:50], option[:75]
+
+
 def format_article(article_json):
     content = article_json['Content']
     question_ls = []
@@ -16,14 +23,19 @@ def format_article(article_json):
             ans = ord(i['Answer']) - ord('A')
         quesiton_id =i['Q_id']
 
-        for j, option in enumerate(i['Choices']):
+#         for j, option in enumerate(i['Choices']):
+        for j in range(4):
+            option = i['Choices'][j] if j < len(i['Choices']) else "[PAD]"
             score = 1 if ans == j else 0
-            format_str = f"[CLS] {content} [SEP] {query} {option} [SEP]"
+
+            content, query, option = length_clip(content, query, option)
+            format_str = f"[CLS]{content}[SEP]{query}[SEP]{option}[SEP]"
 
             if ans is not None:
                 question_ls.append((quesiton_id, format_str, score))
             else:
                 question_ls.append((quesiton_id, format_str))
+                
 
     return question_ls
 

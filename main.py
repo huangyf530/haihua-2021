@@ -9,6 +9,7 @@ from datasets import load_dataset, load_metric
 from tqdm.auto import tqdm
 import torch
 import numpy as np
+from torch.utils.data import RandomSampler, SequentialSampler, DistributedSampler
 from torch.utils.data.dataloader import DataLoader
 from transformers import (
     CONFIG_MAPPING,
@@ -170,7 +171,7 @@ def parse_args():
 
     return args
 
-def train(args, model, train_data, dev_data):
+def train(args, model, train_data, dev_data, device):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_data) if args.local_rank == -1 else DistributedSampler(train_data)
     train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=args.n_gpu)
@@ -236,14 +237,24 @@ def train(args, model, train_data, dev_data):
     else:
         completed_steps = 0
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args.max_train_steps), disable=args.local_rank not in [-1, 0])
     log_loss = 0.0
+    accumulate_step = 0
     for epoch in range(start_epoch, args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
+            batch = (t.to(device) for t in batch)
+            input_ids, attention_masks, token_type_ids, labels = batch
+            batch_size = input_ids.shape[0]
+            sequence_len = input_ids.shape[-1]
+            inputs = {"input_ids": input_ids,
+                      "attention_mask": attention_masks,
+                      "token_type_ids": token_type_ids,
+                      "labels": labels}
+            outputs = model(**inputs)
             loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
+            accumulate_step += 1
             loss.backward()
             log_loss += loss.item()
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
@@ -252,11 +263,18 @@ def train(args, model, train_data, dev_data):
                 optimizer.zero_grad()
                 progress_bar.update(1)
                 completed_steps += 1
+                log_loss = log_steps * args.gradient_accumulation_steps / accumulate_step
                 if args.local_rank in [-1, 0] and completed_steps % args.log_steps == 0:
                     # log information
+                    log_loss = torch.tensor([log_loss], device=device)
+                    torch.distributed.all_reduce(log_loss)
+                    log_loss = log_loss[0] / torch.distributed.get_world_size()
+                    log_loss = log_loss.item()
                     tb_writer.add_scalar('lr', lr_scheduler.get_last_lr()[0], completed_steps)
                     tb_writer.add_scalar('loss/Train', log_loss, completed_steps)
+                    progress_bar.set_description("Train loss: {:.4f}".format(log_loss))
                 log_loss = 0.0
+                accumulate_step = 0
                 if args.local_rank in [-1, 0] and args.save_steps is not None and completed_steps % args.save_steps == 0:
                     # save the model
                     output_dir = os.path.join(args.output_dir, "checkpoint-{:d}".format(completed_steps))
@@ -273,6 +291,76 @@ def train(args, model, train_data, dev_data):
             os.mkdir(output_dir)
         save_model(model, optimizer, lr_scheduler, output_dir, epoch, completed_steps, args.max_train_steps)
     # TODO: Evaluation
+
+def evaluation(args, model, dev_data, device, metric):
+    """evlaluation on dev data or test data"""
+    model.eval()
+    eval_batch_size = args.per_device_eval_batch_size * max(1, args.n_gpu)
+    dev_sampler = SequentialSampler(dev_data) if args.local_rank == -1 else DistributedSampler(dev_data)
+    dev_dataloader = DataLoader(dev_data, batch_size=eval_batch_size, sampler=dev_sampler, num_workers=args.n_gpu)
+    losses = []
+    for index, batch in enumerate(dev_dataloader):
+        batch = (t.to(device) for t in batch)
+        input_ids, attention_masks, token_type_ids, labels = batch
+        batch_size = input_ids.shape[0]
+        sequence_len = input_ids.shape[-1]
+        inputs = {"input_ids": input_ids,
+                    "attention_mask": attention_masks,
+                    "token_type_ids": token_type_ids,
+                    "labels": labels}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        predictions = outputs.logits.argmax(dim=-1)
+        loss = outputs.loss
+        if args.local_rank != -1:
+            torch.distributed.all_reduce(loss)
+            loss = loss / torch.distributed.get_world_size()
+        losses.append(loss.item())
+        if args.local_rank != -1:
+            all_predictions = [None] * torch.distributed.get_world_size() if args.local_rank == 0 else None
+            torch.distributed.gather(predictions, all_predictions, dst=0)
+            all_labels = [None] * torch.distributed.get_world_size() if args.local_rank == 0 else None
+            torch.distributed.gather(labels, all_labels, dst=0)
+            if args.local_rank == 0:
+                labels = torch.stack(all_labels, dim=0)
+                predictions = torch.stack(all_predictions, dim=0)
+        if args.local_rank in [-1, 0]:  
+            metric.add_batch(
+                predictions=predictions,
+                references=labels,
+            )
+    eval_metric = None
+    loss = np.mean(losses)
+    if args.local_rank in [-1, 0]:
+        eval_metric = metric.compute()
+        logger.info(f"Evaluation:  loss {loss} {eval_metric}")
+    model.train()  # to trian mode
+    if args.local_rank != -1:
+        # synchronize
+        torch.distributed.barrier()
+    return loss, eval_metric
+
+def predict(args, model, test_data, device):
+    """predict on test data, should be done on single gpu"""
+    model = model.module if hasattr(model, "module") else model
+    model.eval()
+    eval_batch_size = args.per_device_eval_batch_size
+    dev_sampler = SequentialSampler(test_data)
+    dev_dataloader = DataLoader(test_data, batch_size=eval_batch_size, sampler=dev_sampler, num_workers=1)
+    all_predictions = []
+    for index, batch in enumerate(dev_dataloader):
+        batch = (t.to(device) for t in batch)
+        input_ids, attention_masks, token_type_ids = batch
+        batch_size = input_ids.shape[0]
+        sequence_len = input_ids.shape[-1]
+        inputs = {"input_ids": input_ids,
+                    "attention_mask": attention_masks,
+                    "token_type_ids": token_type_ids}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        predictions = outputs.logits.argmax(dim=-1)
+        all_predictions.extend(predictions.tolist())
+    return all_predictions
 
 def save_model(model, optimizer, scheduler, output_dir, epoch, completed_steps, max_steps):
     model_to_save = model_to_save = model.module if hasattr(model, 'module') else model
@@ -307,7 +395,6 @@ if __name__=="__main__":
         device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend='nccl')
         args.n_gpu = 1
-    args.device = device
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -375,5 +462,5 @@ if __name__=="__main__":
     
     if args.local_rank == 0:
         torch.distributed.barrier()
-    model.to(args.device)
+    model.to(device)
     

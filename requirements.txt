@@ -1,0 +1,4 @@
+transformers==4.4.2
+pytorch==1.8.1
+tqdm
+tensorboard==2.4.0

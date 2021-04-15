@@ -1,13 +1,18 @@
-export CUDA_VISIBLE_DEVICES=7
+#!/bin/bash
+# export CUDA_VISIBLE_DEVICES=7
 DATASET_PATH=data
 
 SAVE_PATH=models/bert-base-chinese
+DATA_PATH=data-raw
 
 MODEL_ARGS="--model_name_or_path bert-base-chinese \
             --tokenizer_name bert-base-chinese \
             --config_name bert-base-chinese \
             --max_seq_length 512"
-DARA_ARGS
+
+DATA_ARGS="--train_file $DATA_PATH/train.json \
+           --predict_file $DATA_PATH/validation.json"
+
 TRAIN_ARGS="--train \
             --eval \
             --predict \
@@ -26,5 +31,6 @@ TRAIN_ARGS="--train \
             --seed 2020"
 
 python main.py \
+       $DATA_ARGS \
        $MODEL_ARGS \
        $TRAIN_ARGS

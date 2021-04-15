@@ -3,3 +3,6 @@ plot
 .vscode
 .DS_Store
 data-raw
+scripts/*.sbatch.sh
+logs
+__pycache__

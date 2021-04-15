@@ -5,7 +5,8 @@ import math
 import os
 import random
 import datasets
-from datasets import load_dataset, load_metric
+from datasets import load_metric, Dataset
+import json
 from tqdm.auto import tqdm
 import torch
 import numpy as np
@@ -24,6 +25,7 @@ from transformers import (
     get_scheduler,
 )
 from torch.utils.tensorboard import SummaryWriter
+from utils import convert_data_structure
 
 logger = logging.getLogger(__name__)
 # You should update this to your particular problem to have better documentation of `model_type`
@@ -146,7 +148,7 @@ def parse_args():
     )
     parser.add_argument(
         "--lr_scheduler_type",
-        type=SchedulerType,
+        type=str,
         default="linear",
         help="The scheduler type to use.",
         choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
@@ -197,7 +199,7 @@ def parse_args():
     )
     parser.add_argument(
         "--predict",
-        type="store_true",
+        action="store_true",
         help="whehter to predict on test dataset."
     )
     args = parser.parse_args()
@@ -459,15 +461,16 @@ if __name__=="__main__":
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    data_files = {}
-    if args.train_file is not None:
-        data_files["train"] = args.train_file
-    if args.validation_file is not None:
-        data_files["validation"] = args.validation_file
-    extension = args.train_file.split(".")[-1]
-
-    raw_datasets = load_dataset(extension, data_files=data_files)
-    
+    datas = {}
+    if args.train_file is not None and args.train:
+        train_json = json.load(open(args.train_file))
+        datas["train"] = Dataset.from_dict(convert_data_structure(train_json))
+        logger.info(f"Load train data number: {datas['train'].num_rows}")
+    if args.predict_file is not None and args.predict:
+        predict_json = json.load(open(args.predict_file))
+        datas["predict"] = Dataset.from_dict(convert_data_structure(predict_json, ispredict=True))
+        logger.info(f"Load predict data number: {datas['predict'].num_rows}")
+    quit()
     # Load pretrained model and tokenizer
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
@@ -515,5 +518,5 @@ if __name__=="__main__":
         if args.local_rank in [-1, 0]:
             # get model on single gpu
             model = model.module if hasattr(model, "module") else model
-            predictions = predict(args, model, test_data， device)
+            predictions = predict(args, model, test_data, device)
     

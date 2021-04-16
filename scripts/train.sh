@@ -3,7 +3,7 @@
 DATASET_PATH=data
 
 SAVE_PATH=models/bert-base-chinese
-DATA_PATH=data-raw
+DATA_PATH=data
 
 MODEL_ARGS="--model_name_or_path bert-base-chinese \
             --tokenizer_name bert-base-chinese \
@@ -11,6 +11,7 @@ MODEL_ARGS="--model_name_or_path bert-base-chinese \
             --max_seq_length 512"
 
 DATA_ARGS="--train_file $DATA_PATH/train.json \
+           --validation_file $DATA_PATH/dev.jsonl \
            --predict_file $DATA_PATH/validation.json"
 
 TRAIN_ARGS="--train \

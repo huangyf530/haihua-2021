@@ -1,10 +1,23 @@
 import json
+from random import shuffle
+import logging
 
 train_keys = ["ID", "Q_id", "Content", "Question", "Choices", "Answer"]
 test_keys = ["ID", "Q_id", "Content", "Question", "Choices"]
+logger = logging.getLogger(__name__)
 
+def shuffle_data(data, split):
+    indexes = list(range(len(data)))
+    shuffle(indexes)
+    train_rate = split[0] / (split[0] + split[1])
+    dev_rate = split[1] / (split[0] + split[1])
+    train_num = int(len(data) * train_rate)
+    dev_num = len(data) - train_num
+    train_data = [data[index] for index in indexes[:train_num]]
+    dev_data = [data[index] for index in indexes[train_num:]]
+    return train_data, dev_data
 
-def convert_data_structure(data, ispredict=False):
+def convert_data_structure(data, cache_file=None, ispredict=False):
     assert isinstance(data, list)
     new_data = {}
     if ispredict:
@@ -23,5 +36,13 @@ def convert_data_structure(data, ispredict=False):
             new_data['Q_id'].append(q['Q_id'])
             if not ispredict:
                 new_data["Answer"].append(q['Answer'])
+    if cache_file is not None:
+        fout = open(cache_file, 'w')
+        for index in range(len(new_data['ID'])):
+            json_to_write = {}
+            for key in new_data.keys():
+                json_to_write[key] = new_data[key][index]
+            fout.write(json.dumps(json_to_write) + "\n")
+        logger.info(f"Dump {len(new_data['ID'])} to {cache_file}")
     return new_data
 

@@ -5,7 +5,7 @@ import math
 import os
 import random
 import datasets
-from datasets import load_metric, Dataset
+from datasets import load_metric, Dataset, load_dataset
 import json
 from tqdm.auto import tqdm
 import torch
@@ -25,7 +25,7 @@ from transformers import (
     get_scheduler,
 )
 from torch.utils.tensorboard import SummaryWriter
-from utils import convert_data_structure
+from utils import convert_data_structure, shuffle_data
 
 logger = logging.getLogger(__name__)
 # You should update this to your particular problem to have better documentation of `model_type`
@@ -60,13 +60,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     # data args
     parser.add_argument(
-        "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
+        "--train_file", type=str, default=None, help="A jsonl or a json file containing the training data."
     )
     parser.add_argument(
-        "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
+        "--validation_file", type=str, default=None, help="A jsonl or a json file containing the validation data."
     )
     parser.add_argument(
-        "--predict_file", type=str, default=None, help="A csv or a json file containing the predict data."
+        "--predict_file", type=str, default=None, help="A jsonl or a json file containing the predict data."
+    )
+    parser.add_argument(
+        "--split", type=str, default="9,1", help="split rate for train and dev."
     )
     parser.add_argument(
         "--max_seq_length",
@@ -205,6 +208,7 @@ def parse_args():
     args = parser.parse_args()
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
+    args.split = [int(t) for t in args.split.split(',')]
 
     return args
 
@@ -427,6 +431,46 @@ def load_checkpoint_from_disk(path, optimizer, scheduler):
     max_steps = checkpoint['max_steps']
     return epoch, completed_steps, max_steps
 
+def load_dataset_from_disk(args):
+    datas = {}
+    if args.train_file is not None and args.train:
+        extension = args.train_file.split('.')[-1]
+        assert extension in ['json', 'jsonl'], f"{args.train_file} should be json or jsonl file."
+        if extension == "json":
+            train_cache_file = ''.join(args.train_file.split('.')[:-1]) + ".jsonl"
+            if os.path.exists(train_cache_file):
+                logger.info(f"Found cache file for train and dev, try to use cache data in {train_cache_file}")
+                exists = 'jsonl'
+        if extension == "json":
+            train_json = json.load(open(args.train_file))
+            train_json, dev_json = shuffle_data(train_json, args.split)
+            datas["train"] = Dataset.from_dict(convert_data_structure(train_json, cache_file=train_cache_file))
+            datas["dev"] = Dataset.from_dict(convert_data_structure(dev_json, cache_file=args.validation_file))
+        elif extension == "jsonl":
+            datas['train'] = load_dataset("json", data_files=args.train_file)
+            datas['dev'] = load_dataset("json", data_files=args.validation_file)
+        logger.info(f"Load train data number: {datas['train'].num_rows}")
+        logger.info(f"Load dev data number: {datas['dev'].num_rows}")
+    if args.eval and not args.train:
+        extension = args.validation_file.split('.')[-1]
+        assert extension == 'jsonl', f"validation file should be jsonl file, but is {extension} file"
+        datas['dev'] = load_dataset("json", data_files=args.validation_file)
+    if args.predict_file is not None and args.predict:
+        extension = args.predict_file.split('.')[-1]
+        assert extension in ['json', 'jsonl'], f"predict file should be json or jsonl file, but is {extension}"
+        if extension == "json":
+            predict_cache_file = ''.join(args.predict_file.split('.')[:-1]) + ".jsonl"
+            if os.path.exists(predict_cache_file):
+                logger.info(f"Found cache file for prediction, try to use cache data in {predict_cache_file}")
+                exists = 'jsonl'
+        if extension == 'json':
+            predict_json = json.load(open(args.predict_file))
+            datas["predict"] = Dataset.from_dict(convert_data_structure(predict_json, ispredict=True, cache_file=predict_cache_file))
+        elif extension == "jsonl":
+            datas['predict'] = load_dataset("json", data_files=args.predict_file)
+        logger.info(f"Load predict data number: {datas['predict'].num_rows}")
+    return datas
+
 if __name__=="__main__":
     args = parse_args()
     # Setup CUDA, GPU & distributed training
@@ -461,16 +505,6 @@ if __name__=="__main__":
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    datas = {}
-    if args.train_file is not None and args.train:
-        train_json = json.load(open(args.train_file))
-        datas["train"] = Dataset.from_dict(convert_data_structure(train_json))
-        logger.info(f"Load train data number: {datas['train'].num_rows}")
-    if args.predict_file is not None and args.predict:
-        predict_json = json.load(open(args.predict_file))
-        datas["predict"] = Dataset.from_dict(convert_data_structure(predict_json, ispredict=True))
-        logger.info(f"Load predict data number: {datas['predict'].num_rows}")
-    quit()
     # Load pretrained model and tokenizer
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
@@ -503,6 +537,9 @@ if __name__=="__main__":
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMultipleChoice.from_config(config)
+    
+    datas = load_dataset_from_disk(args)
+    quit()
     
     if args.local_rank == 0:
         torch.distributed.barrier()

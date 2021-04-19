@@ -5,4 +5,5 @@ plot
 data-raw
 scripts/*.sbatch.sh
 logs
+models
 __pycache__

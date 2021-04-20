@@ -422,20 +422,15 @@ def evaluation(args, model, dev_data, device, metric):
             loss = loss / torch.distributed.get_world_size()
         losses.append(loss.item())
         if args.local_rank != -1:
-            # TODO: multiple process gather
-            print("label", labels, labels.shape)
-            print("prediction", predictions, predictions.shape)
-            all_predictions = [torch.zeros(batch_size, device=device)] * torch.distributed.get_world_size()
+            # all_gather should have same dtype with origin tensor
+            all_predictions = [torch.zeros(batch_size, device=device).to(torch.int64) for _ in range(torch.distributed.get_world_size())]
             torch.distributed.all_gather(all_predictions, predictions)
-            all_labels = [torch.zeros(batch_size, device=device)] * torch.distributed.get_world_size()
-            torch.distributed.all_gather(all_labels, labels)
-            print(all_labels)
+            all_labels = [torch.zeros(batch_size, device=device).to(torch.int64) for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather(all_labels, labels)          
             if args.local_rank == 0:
-                labels = torch.stack(all_labels, dim=0)
-                predictions = torch.stack(all_predictions, dim=0)
-                print(labels)
-                print(predictions)
-        if args.local_rank in [-1, 0]:  
+                labels = torch.stack(all_labels).view(-1)
+                predictions = torch.stack(all_predictions).view(-1)
+        if args.local_rank in [-1, 0]:
             metric.add_batch(
                 predictions=predictions,
                 references=labels,

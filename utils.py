@@ -61,3 +61,13 @@ def report_memory(name):
         torch.cuda.max_memory_reserved() / mega_bytes)
     print("\n{}\n".format(string),
               flush=True)
+            
+def write_to_csv(data, predictions, file_name):
+    assert len(data) == len(predictions)
+    label_list = ['A', 'B', 'C', 'D']
+    fout = open(file_name, 'w')
+    fout.write("id,label\n")
+    for index, d in enumerate(data):
+        p = predictions[index]
+        fout.write("{},{}\n".format(d["Q_id"], label_list[p]))
+    logger.info(f"Write result to {file_name}.")

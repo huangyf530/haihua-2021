@@ -10,6 +10,7 @@ from datasets import load_metric, Dataset, load_dataset, DatasetDict
 import json
 from tqdm.auto import tqdm
 import torch
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import RandomSampler, SequentialSampler, DistributedSampler
 from torch.utils.data.dataloader import DataLoader
@@ -26,7 +27,7 @@ from transformers import (
 )
 from typing import List, Dict, Any, NewType
 from torch.utils.tensorboard import SummaryWriter
-from utils import convert_data_structure, shuffle_data, report_memory
+from utils import convert_data_structure, shuffle_data, report_memory, write_to_csv
 
 metric_logger_name = os.path.join('/'.join(datasets.__file__.split('/')[:-1]), "metric.py")
 logger = logging.getLogger(__name__)
@@ -68,6 +69,12 @@ def parse_args():
     )
     parser.add_argument(
         "--predict_file", type=str, default=None, help="A jsonl or a json file containing the predict data."
+    )
+    parser.add_argument(
+        "--predict_out", type=str, default="data/prediction.csv", help="file to write predictions."
+    )
+    parser.add_argument(
+        "--ensemble_models", type=str, default=None, help="models to ensemble."
     )
     parser.add_argument(
         "--split", type=str, default="9,1", help="split rate for train and dev."
@@ -237,7 +244,7 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
     # Scheduler and math around the number of training steps.
-    num_update_steps_per_epoch = math.ceil(len(train_data) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     else:
@@ -291,7 +298,10 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
     for epoch in range(start_epoch, args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            # print(tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(batch['input_ids'][0][0])))
+            # if step == 0:
+            #     print(tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(batch['input_ids'][0][0])))
+            #     print(batch['labels'][0])
+            #     print(batch['input_ids'].shape)
             # print(batch['attention_mask'][0][0])
             # print(batch['token_type_ids'][0][0])
             for key in batch:
@@ -312,6 +322,11 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
             step_loss += loss.item()
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
+                # for n, p in model.classifier.named_parameters():
+                #     print(n, p)
+                #     print(n, p.grad.data)
+                # if completed_steps >= 2:
+                #     quit()
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 # progress_bar.update(1)
@@ -442,7 +457,7 @@ def evaluation(args, model, dev_data, device, metric):
     start = time.time()
     return loss, eval_metric
 
-def predict(args, model, test_data, device):
+def predict(args, model, test_data, device, return_logit=False):
     """predict on test data, should be done on single gpu"""
     model = model.module if hasattr(model, "module") else model
     model.eval()
@@ -450,6 +465,7 @@ def predict(args, model, test_data, device):
     dev_sampler = SequentialSampler(test_data)
     dev_dataloader = DataLoader(test_data, batch_size=eval_batch_size, sampler=dev_sampler, collate_fn=default_data_collator)
     all_predictions = []
+    all_logits = []
     for index, batch in enumerate(dev_dataloader):
         for key in batch:
             if torch.is_tensor(batch[key]):
@@ -463,7 +479,11 @@ def predict(args, model, test_data, device):
         with torch.no_grad():
             outputs = model(**inputs)
         predictions = outputs.logits.argmax(dim=-1)
+        if return_logit:
+            all_logits.extend(outputs.logits.tolist())
         all_predictions.extend(predictions.tolist())
+    if return_logit:
+        return all_predictions, all_logits
     return all_predictions
 
 def save_model(model, optimizer, scheduler, output_dir, epoch, completed_steps, max_steps):
@@ -631,7 +651,7 @@ if __name__=="__main__":
             for one_choices in choices:
                 while len(one_choices) < 4:
                     one_choices.append([pad_token] * 10)
-            second_sentences = [[f"{q}{sep_token}{c[2:]}" for c in choices[index]] for index, q in enumerate(questions)]
+            second_sentences = [[f"{q} {c[2:]}" for c in choices[index]] for index, q in enumerate(questions)]
 
             # Flatten out
             first_sentences = sum(first_sentences, [])
@@ -695,6 +715,17 @@ if __name__=="__main__":
     if args.predict:
         if args.local_rank in [-1, 0]:
             # get model on single gpu
-            model = model.module if hasattr(model, "module") else model
-            predictions = predict(args, model, preprocess_datasets['predict'], device)
+            if args.ensemble_models is not None:
+                args.ensemble_models = args.ensemble_models.split(',')
+                all_predictions = []
+                for model_path in args.ensemble_models:
+                    model = AutoModelForMultipleChoice.from_pretrained(model_path)
+                    model.to(device)
+                    current_predictions, current_logits = predict(args, model, preprocess_datasets['predict'], device, return_logit=True)
+                    all_predictions.append(current_logits)  # model_number, example_num, 4
+                predictions = np.mean(all_predictions, 0).argmax(1)
+            else:
+                model = model.module if hasattr(model, "module") else model
+                predictions = predict(args, model, preprocess_datasets['predict'], device)
+            write_to_csv(preprocess_datasets['predict'], predictions, args.predict_out)
     

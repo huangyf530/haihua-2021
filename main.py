@@ -27,7 +27,7 @@ from transformers import (
 )
 from typing import List, Dict, Any, NewType
 from torch.utils.tensorboard import SummaryWriter
-from utils import convert_data_structure, shuffle_data, report_memory, write_to_csv
+from utils import convert_data_structure, shuffle_data, report_memory, write_to_csv, AverageMeter
 
 metric_logger_name = os.path.join('/'.join(datasets.__file__.split('/')[:-1]), "metric.py")
 logger = logging.getLogger(__name__)
@@ -265,8 +265,7 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
             tb_writer = SummaryWriter(args.tensorboard_dir, purge_step=purge_step)
     # Distributed training (should be after apex fp16 initialization)
     model = set_model_distributed(args, model)
-    # Metrics
-    metric = load_metric("accuracy")
+    accs = AverageMeter()
     # Train!
     world_size = (torch.distributed.get_world_size() if args.local_rank != -1 else 1)
     total_batch_size = args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps
@@ -320,13 +319,11 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
             accumulate_step += 1
             loss.backward()
             step_loss += loss.item()
+            logits = outputs.logits
+            acc = (logits.argmax(1)==labels).sum().item() / batch_size
+            accs.update(acc, batch_size)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 optimizer.step()
-                # for n, p in model.classifier.named_parameters():
-                #     print(n, p)
-                #     print(n, p.grad.data)
-                # if completed_steps >= 2:
-                #     quit()
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 # progress_bar.update(1)
@@ -335,12 +332,17 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
                 log_loss += step_loss
                 if completed_steps % args.log_steps == 0:
                     log_loss = log_loss / args.log_steps
+                    log_acc = accs.avg
+                    accs.reset()
                     if args.local_rank != -1:
                         # reduce from all process
                         log_loss = torch.tensor([log_loss], device=device)
                         torch.distributed.all_reduce(log_loss)
                         log_loss = log_loss[0] / torch.distributed.get_world_size()
                         log_loss = log_loss.item()
+                        log_acc = torch.tensor([log_acc], device=device)
+                        torch.distributed.all_reduce(log_acc)
+                        log_acc = (log_acc[0] / torch.distributed.get_world_size()).item()
                     consume_time = (time.time() - start) / args.log_steps
                     time_left = consume_time * (args.max_train_steps - completed_steps)
                     if args.local_rank in [-1, 0]:
@@ -349,7 +351,8 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
                         # log information
                         tb_writer.add_scalar('lr', lr_scheduler.get_last_lr()[0], completed_steps)
                         tb_writer.add_scalar('loss/Train', log_loss, completed_steps)
-                        logger.info("Epoch {} | Steps {:d} | Train loss {:.3f} | Seconds per batch: {:.3f} | Time left {:.3f}".format(epoch, completed_steps, log_loss, consume_time, time_left))
+                        tb_writer.add_scalar('accuracy/Train', log_acc, completed_steps)
+                        logger.info("Epoch {} | Steps {:d} | loss {:.3f} | acc {:.3f} | Seconds per batch: {:.3f} | Time left {:.3f}".format(epoch, completed_steps, log_loss, log_acc, consume_time, time_left))
                         # progress_bar.set_description("Train loss: {:.4f}".format(log_loss))
                     start = time.time()  # reset time
                     see_memory = False
@@ -358,7 +361,7 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
                 accumulate_step = 0
                 if args.eval_steps is not None and completed_steps % args.eval_steps == 0:
                     # evaluation during train
-                    loss, eval_metric = evaluation(args, model, dev_data, device, metric)
+                    loss, eval_metric = evaluation(args, model, dev_data, device)
                     if args.local_rank in [-1, 0]:
                         # only main process can log
                         tb_writer.add_scalar('loss/Eval', loss, completed_steps)
@@ -380,7 +383,7 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
 
             if completed_steps >= args.max_train_steps:
                 break
-    loss, eval_metric = evaluation(args, model, dev_data, device, metric)
+    loss, eval_metric = evaluation(args, model, dev_data, device)
     if args.local_rank in [-1, 0]:
         # only main process can log
         tb_writer.add_scalar('loss/Eval', loss, completed_steps)
@@ -394,14 +397,17 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
         save_model(model, optimizer, lr_scheduler, output_dir, epoch, completed_steps, args.max_train_steps)
     return completed_steps
 
-def evaluation(args, model, dev_data, device, metric):
+def evaluation(args, model, dev_data, device):
     """evlaluation on dev data or test data"""
+    accs = AverageMeter()
     model.eval()
     eval_batch_size = args.per_device_eval_batch_size * max(1, args.n_gpu)
     dev_sampler = SequentialSampler(dev_data) if args.local_rank == -1 else DistributedSampler(dev_data)
     dev_dataloader = DataLoader(dev_data, batch_size=eval_batch_size, sampler=dev_sampler, collate_fn=default_data_collator)
     logger.info(f"Evaluation for {len(dev_dataloader)} steps:")
     losses = []
+    global start
+    start = time.time()
     for index, batch in enumerate(dev_dataloader):
         for key in batch:
             if torch.is_tensor(batch[key]):
@@ -431,17 +437,18 @@ def evaluation(args, model, dev_data, device, metric):
                 labels = torch.stack(all_labels).view(-1)
                 predictions = torch.stack(all_predictions).view(-1)
         if args.local_rank in [-1, 0]:
-            metric.add_batch(
-                predictions=predictions,
-                references=labels,
-            )
+            acc = (predictions==labels).sum().item() / predictions.shape[0]
+            accs.update(acc, predictions.shape[0])
+            # metric.add_batch(
+            #     predictions=predictions,
+            #     references=labels,
+            # )
     eval_metric = None
     loss = np.mean(losses)
-    global start
     consume_time = time.time() - start
     if args.local_rank in [-1, 0]:
-        eval_metric = metric.compute()
-        eval_str = "Evaluation on {:d} examples:  loss {:.3f} consume time {:.3f}s".format(len(dev_data), loss, consume_time)
+        eval_metric = {"accuracy": accs.avg}
+        eval_str = "Evaluation on {:d} examples: loss {:.3f} consume time {:.3f}s".format(len(dev_data), loss, consume_time)
         for key in eval_metric:
             eval_str += " {:s} {:.3f}".format(key, eval_metric[key])
         logger.info(eval_str)
@@ -702,14 +709,13 @@ if __name__=="__main__":
 
     if args.train:
         total_steps = train(args, model, preprocess_datasets['train'], preprocess_datasets['dev'], device, tokenizer)
-    if args.eval and not args.train:
+    if (not args.train) and args.eval:
         # only evaluation without train
         model = set_model_distributed(args, model)
-        metric = load_metric("accuracy")
-        loss, eval_metric = evaluation(args, model, dev_data, device, metric)
+        loss, eval_metric = evaluation(args, model, preprocess_datasets['dev'], device)
     if args.predict:
         if args.local_rank in [-1, 0]:
-            # get model on single gpu
+            logger.info("Predict on validation data...")
             if args.ensemble_models is not None:
                 args.ensemble_models = args.ensemble_models.split(',')
                 all_predictions = []
@@ -720,6 +726,7 @@ if __name__=="__main__":
                     all_predictions.append(current_logits)  # model_number, example_num, 4
                 predictions = np.mean(all_predictions, 0).argmax(1)
             else:
+                # get model on single gpu
                 model = model.module if hasattr(model, "module") else model
                 predictions = predict(args, model, preprocess_datasets['predict'], device)
             write_to_csv(preprocess_datasets['predict'], predictions, args.predict_out)

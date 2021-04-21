@@ -7,6 +7,22 @@ train_keys = ["ID", "Q_id", "Content", "Question", "Choices", "Answer"]
 test_keys = ["ID", "Q_id", "Content", "Question", "Choices"]
 logger = logging.getLogger(__name__)
 
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
 def shuffle_data(data, split):
     indexes = list(range(len(data)))
     shuffle(indexes)

@@ -382,12 +382,12 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
 
             if completed_steps >= args.max_train_steps:
                 break
-    # loss, eval_metric = evaluation(args, model, dev_data, device)
-    # if args.local_rank in [-1, 0]:
-    #     # only main process can log
-    #     tb_writer.add_scalar('loss/Eval', loss, completed_steps)
-    #     for key in eval_metric:
-    #         tb_writer.add_scalar(f'{key}/Eval', eval_metric[key], completed_steps)
+    loss, eval_metric = evaluation(args, model, dev_data, device)
+    if args.local_rank in [-1, 0]:
+        # only main process can log
+        tb_writer.add_scalar('loss/Eval', loss, completed_steps)
+        for key in eval_metric:
+            tb_writer.add_scalar(f'{key}/Eval', eval_metric[key], completed_steps)
     if args.local_rank in [-1, 0]:
         # save the model on main process
         output_dir = os.path.join(args.output_dir, "checkpoint-{:d}".format(completed_steps))
@@ -408,7 +408,7 @@ def evaluation(args, model, dev_data, device):
     global start
     start = time.time()
 
-    print(len(dev_dataloader))
+    # print(len(dev_dataloader))
 
     for index, batch in enumerate(dev_dataloader):
         for key in batch:
@@ -687,8 +687,8 @@ if __name__=="__main__":
                         new_label.append(c_label)
 
 
-            print(len(new_first))
-            print(new_qid[:100])
+            # print(len(new_first))
+            # print(new_qid[:100])
             
             # Tokenize
             tokenized_examples = tokenizer(

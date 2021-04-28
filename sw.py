@@ -19,10 +19,8 @@ from transformers import (
     MODEL_MAPPING,
     AdamW,
     AutoConfig,
-    AutoModelForMultipleChoice,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
-    PreTrainedTokenizerBase,
-    SchedulerType,
     get_scheduler,
 )
 from typing import List, Dict, Any, NewType
@@ -270,6 +268,7 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
     world_size = (torch.distributed.get_world_size() if args.local_rank != -1 else 1)
     total_batch_size = args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps
 
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_data)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -383,12 +382,12 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
 
             if completed_steps >= args.max_train_steps:
                 break
-    loss, eval_metric = evaluation(args, model, dev_data, device)
-    if args.local_rank in [-1, 0]:
-        # only main process can log
-        tb_writer.add_scalar('loss/Eval', loss, completed_steps)
-        for key in eval_metric:
-            tb_writer.add_scalar(f'{key}/Eval', eval_metric[key], completed_steps)
+    # loss, eval_metric = evaluation(args, model, dev_data, device)
+    # if args.local_rank in [-1, 0]:
+    #     # only main process can log
+    #     tb_writer.add_scalar('loss/Eval', loss, completed_steps)
+    #     for key in eval_metric:
+    #         tb_writer.add_scalar(f'{key}/Eval', eval_metric[key], completed_steps)
     if args.local_rank in [-1, 0]:
         # save the model on main process
         output_dir = os.path.join(args.output_dir, "checkpoint-{:d}".format(completed_steps))
@@ -408,6 +407,9 @@ def evaluation(args, model, dev_data, device):
     losses = []
     global start
     start = time.time()
+
+    print(len(dev_dataloader))
+
     for index, batch in enumerate(dev_dataloader):
         for key in batch:
             if torch.is_tensor(batch[key]):
@@ -422,6 +424,7 @@ def evaluation(args, model, dev_data, device):
         with torch.no_grad():
             outputs = model(**inputs)
         predictions = outputs.logits.argmax(dim=-1)
+        # print(outputs.logits)
         loss = outputs.loss
         if args.local_rank != -1:
             torch.distributed.all_reduce(loss)
@@ -469,7 +472,6 @@ def predict(args, model, test_data, device, return_logit=False):
     all_predictions = []
     all_logits = []
     for index, batch in enumerate(dev_dataloader):
-        print(f"predicted: {index}")
         for key in batch:
             if torch.is_tensor(batch[key]):
                 batch[key] = batch[key].to(device)
@@ -532,14 +534,14 @@ def load_model_config_tokenizer(args):
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
     if args.model_name_or_path:
-        model = AutoModelForMultipleChoice.from_pretrained(
+        model = AutoModelForSequenceClassification.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelForMultipleChoice.from_config(config)
+        model = AutoModelForSequenceClassification.from_config(config)
     return model, config, tokenizer
 
 def load_dataset_from_disk(args):
@@ -660,36 +662,64 @@ if __name__=="__main__":
             first_sentences = sum(first_sentences, [])
             second_sentences = sum(second_sentences, [])
 
+            # Sliding windows
+            has_label = (label_column_name in examples)
+            if has_label:
+                labels = examples[label_column_name]
+
+            win, overlap = 400, 50
+            new_first, new_second, new_qid = [], [], []
+            new_label = []
+            for i, sent in enumerate(first_sentences):
+                q_index = i // 4
+                c_index = i % 4
+                q_id = examples['Q_id'][q_index]
+                
+                if has_label:        
+                    c_label = 1 if c_index == labels_map[labels[q_index]] else 0
+
+                for p in range(0, len(sent), win-overlap):
+                    new_first.append(sent[p: p+win])
+                    new_second.append(second_sentences[i])
+                    new_qid.append(q_id)
+
+                    if has_label:
+                        new_label.append(c_label)
+
+
+            print(len(new_first))
+            print(new_qid[:100])
+            
             # Tokenize
-            # tokenized_examples = tokenizer(
-            #     first_sentences,
-            #     second_sentences,
-            #     padding=padding,
-            #     truncation="only_first",
-            #     max_length=args.max_seq_length
-            # )
-
             tokenized_examples = tokenizer(
-                first_sentences,
-                second_sentences,
-                # padding=padding,
-                # truncation="only_first",
-                # max_length=args.max_seq_length
+                new_first,
+                new_second,
+                padding=padding,
+                truncation="only_first",
+                max_length=args.max_seq_length
             )
-            # for i in tokenized_examples['input_ids']:
-            #     print(len(i))
-
+            # print(np.array(tokenized_examples['input_ids']).shape)
+            # print(np.array(tokenized_examples['attention_mask']).shape)
             # Un-flatten
-            tokenized_inputs = {k: [v[i : i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_examples.items()}
+            tokenized_inputs = {k: v for k, v in tokenized_examples.items()}
             # print(tokenized_inputs['attention_mask'][-1][-1])
             # print(tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(tokenized_inputs['input_ids'][-1][-1])))
-            if label_column_name in examples:
-                labels = examples[label_column_name]
-                tokenized_inputs["labels"] = [labels_map[l] for l in labels]
-            tokenized_inputs["Q_id"] = examples['Q_id']
-            # print(tokenized_inputs["labels"])
-            # quit()
+
+            # if label_column_name in examples:
+            #     label_pattern = [0] * len(tokenized_inputs['input_ids'])
+            #     labels = examples[label_column_name]
+            #     for i, l in enumerate(labels):
+            #         label_pattern[4*i + labels_map[l]] = 1
+            #     tokenized_inputs['label'] = label_pattern
+
+            # tokenized_inputs["Q_id"] = sum([ [i]*4 for i in examples['Q_id']], [])
+            tokenized_inputs['Q_id'] = new_qid
+            if has_label:
+                tokenized_inputs['label'] = new_label
+
+
             return tokenized_inputs
+
         logger.info("preprocess datasets...")
         # processed_datasets = raw_datasets.map(
         #     preprocess_function, batched=True, remove_columns=raw_datasets["train"].column_names
@@ -732,7 +762,7 @@ if __name__=="__main__":
                 args.ensemble_models = args.ensemble_models.split(',')
                 all_predictions = []
                 for model_path in args.ensemble_models:
-                    model = AutoModelForMultipleChoice.from_pretrained(model_path)
+                    model = AutoModelForSequenceClassification.from_pretrained(model_path)
                     model.to(device)
                     current_predictions, current_logits = predict(args, model, preprocess_datasets['predict'], device, return_logit=True)
                     all_predictions.append(current_logits)  # model_number, example_num, 4
@@ -741,5 +771,8 @@ if __name__=="__main__":
                 # get model on single gpu
                 model = model.module if hasattr(model, "module") else model
                 predictions = predict(args, model, preprocess_datasets['predict'], device)
-            write_to_csv(preprocess_datasets['predict'], predictions, args.predict_out)
+
+            import pandas as pd
+            pd.DataFrame({'id': preprocess_datasets['predict']['Q_id'], 'ans': predictions}).to_csv("ans.csv", index=False)
+            # write_to_csv(preprocess_datasets['predict'], predictions, args.predict_out)
     

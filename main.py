@@ -24,13 +24,19 @@ from transformers import (
     PreTrainedTokenizerBase,
     SchedulerType,
     get_scheduler,
+    RobertaTokenizer,
+    BertTokenizer
 )
 from typing import List, Dict, Any, NewType
 from torch.utils.tensorboard import SummaryWriter
 from utils import convert_data_structure, shuffle_data, report_memory, write_to_csv, AverageMeter
+# from longformer.longformer import Longformer, LongformerConfig, LongformerForMultipleChoice
+# from longformer.sliding_chunks import pad_to_window_size
 
 metric_logger_name = os.path.join('/'.join(datasets.__file__.split('/')[:-1]), "metric.py")
 logger = logging.getLogger(__name__)
+# Creates once at the beginning of training
+scaler = torch.cuda.amp.GradScaler()
 # You should update this to your particular problem to have better documentation of `model_type`
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -102,6 +108,11 @@ def parse_args():
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=True,
+    )
+    parser.add_argument(
+        "--no_load_optim",
+        action="store_true",
+        help="Don't load optimzer and lr scheduler."
     )
     parser.add_argument(
         "--config_name",
@@ -258,8 +269,9 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
     start_epoch = 0
     purge_step = None
     if os.path.isdir(args.model_name_or_path):
-        start_epoch, completed_steps, args.max_train_steps = load_checkpoint_from_disk(args.model_name_or_path, oprimizer, lr_scheduler)
-        purge_step = completed_steps
+        if not args.no_load_optim:
+            start_epoch, completed_steps, args.max_train_steps = load_checkpoint_from_disk(args.model_name_or_path, optimizer, lr_scheduler)
+            purge_step = completed_steps
     if args.local_rank in [-1, 0]:
         if args.tensorboard_dir is not None:
             tb_writer = SummaryWriter(args.tensorboard_dir, purge_step=purge_step)
@@ -277,7 +289,7 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    if os.path.isdir(args.model_name_or_path):
+    if os.path.isdir(args.model_name_or_path) and not args.no_load_optim:
         logger.info(f"  Load checkpoint from {args.model_name_or_path}")
         logger.info(f"  Competed optimization steps = {completed_steps}")
         logger.info(f"  Start epoch = {start_epoch}")
@@ -294,38 +306,45 @@ def train(args, model, train_data, dev_data, device, tokenizer=None):
     start = time.time()  # log time
     see_memory = True
     model.zero_grad()
+    report_memory("Before Train")
     for epoch in range(start_epoch, args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            # if step == 0:
-            #     print(tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(batch['input_ids'][0][0])))
-            #     print(batch['labels'][0])
-            #     print(batch['input_ids'].shape)
-            # print(batch['attention_mask'][0][0])
-            # print(batch['token_type_ids'][0][0])
+            # input_ids = batch['input_ids']
+            # print(tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids[0][0])))
+            # quit()
             for key in batch:
                 if torch.is_tensor(batch[key]):
                     batch[key] = batch[key].to(device)
             input_ids, attention_masks, token_type_ids, labels = batch['input_ids'], batch['attention_mask'], batch['token_type_ids'], batch['labels']
+            # global_attention_mask = batch['global_attention_mask']
             batch_size = input_ids.shape[0]
             sequence_len = input_ids.shape[-1]
             inputs = {"input_ids": input_ids,
                       "attention_mask": attention_masks,
                       "token_type_ids": token_type_ids,
+                    #   "global_attention_mask": global_attention_mask,
                       "labels": labels}
-            outputs = model(**inputs)
+            with torch.cuda.amp.autocast():
+                outputs = model(**inputs)
             loss = outputs.loss
             loss = loss / args.gradient_accumulation_steps
             accumulate_step += 1
-            loss.backward()
             step_loss += loss.item()
+            # Scales the loss, and calls backward()
+            # to create scaled gradients
+            scaler.scale(loss).backward()
             logits = outputs.logits
             acc = (logits.argmax(1)==labels).sum().item() / batch_size
             accs.update(acc, batch_size)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
+                # Unscales gradients and calls
+                # or skips optimizer.step()
+                scaler.step(optimizer)
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                # Updates the scale for next iteration
+                scaler.update()
                 # progress_bar.update(1)
                 completed_steps += 1
                 step_loss = step_loss * args.gradient_accumulation_steps / accumulate_step
@@ -413,11 +432,13 @@ def evaluation(args, model, dev_data, device):
             if torch.is_tensor(batch[key]):
                 batch[key] = batch[key].to(device)
         input_ids, attention_masks, token_type_ids, labels = batch['input_ids'], batch['attention_mask'], batch['token_type_ids'], batch['labels']
+        # global_attention_mask = batch['global_attention_mask']
         batch_size = input_ids.shape[0]
         sequence_len = input_ids.shape[-1]
         inputs = {"input_ids": input_ids,
                     "attention_mask": attention_masks,
                     "token_type_ids": token_type_ids,
+                    # "global_attention_mask": global_attention_mask,
                     "labels": labels}
         with torch.no_grad():
             outputs = model(**inputs)
@@ -468,7 +489,7 @@ def predict(args, model, test_data, device, return_logit=False):
     dev_dataloader = DataLoader(test_data, batch_size=eval_batch_size, sampler=dev_sampler, collate_fn=default_data_collator)
     all_predictions = []
     all_logits = []
-    for index, batch in enumerate(dev_dataloader):
+    for index, batch in enumerate(tqdm(dev_dataloader, desc="Predicting")):
         for key in batch:
             if torch.is_tensor(batch[key]):
                 batch[key] = batch[key].to(device)
@@ -520,9 +541,9 @@ def load_model_config_tokenizer(args):
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
-
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+        # tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+        tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
@@ -532,6 +553,37 @@ def load_model_config_tokenizer(args):
         )
     if args.model_name_or_path:
         model = AutoModelForMultipleChoice.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+        )
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForMultipleChoice.from_config(config)
+    return model, config, tokenizer
+
+def load_longformer_config_tokenizer(args):
+    if args.config_name:
+        config = LongformerConfig.from_pretrained(args.config_name)
+    elif args.model_name_or_path:
+        config = LongformerConfig.from_pretrained(args.model_name_or_path)
+    else:
+        config = CONFIG_MAPPING[args.model_type]()
+        logger.warning("You are instantiating a new config instance from scratch.")
+    config.attention_mode = 'sliding_chunks'
+
+    if args.tokenizer_name:
+        tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+    elif args.model_name_or_path:
+        tokenizer = RobertaTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+    tokenizer.model_max_length = config.max_position_embeddings
+    if args.model_name_or_path:
+        model = LongformerForMultipleChoice.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
@@ -674,6 +726,16 @@ if __name__=="__main__":
             if label_column_name in examples:
                 labels = examples[label_column_name]
                 tokenized_inputs["labels"] = [labels_map[l] for l in labels]
+            # tokenized_inputs['global_attention_mask'] = []
+            # for index, input_ids in enumerate(tokenized_inputs['input_ids']):
+            #     global_attention_mask = []
+            #     for local_index, input_id in enumerate(input_ids):
+            #         attention_mask = tokenized_inputs['attention_mask'][index][local_index]
+            #         sep_index = input_id.index(tokenizer.sep_token_id)
+            #         total_length = sum(attention_mask)
+            #         second_sentence_length = total_length - sep_index - 1
+            #         global_attention_mask.append([1] + [0] * sep_index + [1] * second_sentence_length + [0] * (args.max_seq_length - total_length))
+            #     tokenized_inputs['global_attention_mask'].append(global_attention_mask)
             tokenized_inputs["Q_id"] = examples['Q_id']
             # print(tokenized_inputs["labels"])
             # quit()
@@ -685,7 +747,11 @@ if __name__=="__main__":
         preprocess_datasets = DatasetDict()
         for key in raw_datasets:
             cacheing_enable = args.cache_data_dir is not None
-            cache_file_name = os.path.join(args.cache_data_dir, f"{key}_{args.seed}_ml{args.max_seq_length}.cache")
+            if key == "predict":
+                cache_file_name = os.path.join(args.cache_data_dir, f"{key}_46_ml{args.max_seq_length}.cache")
+            else:
+                cache_file_name = os.path.join(args.cache_data_dir, f"{key}_{args.seed}_ml{args.max_seq_length}.cache")
+            raw_datasets[key]._data_files = [{"cache_file_name": cache_file_name}]
             preprocess_datasets[key] = raw_datasets[key].map(
                 preprocess_function, batched=True, remove_columns=raw_datasets[key].column_names,
                 load_from_cache_file=cacheing_enable, cache_file_name=cache_file_name,
@@ -719,6 +785,7 @@ if __name__=="__main__":
             if args.ensemble_models is not None:
                 args.ensemble_models = args.ensemble_models.split(',')
                 all_predictions = []
+                logger.info("Predict by {} models...".format(len(args.ensemble_models)))
                 for model_path in args.ensemble_models:
                     model = AutoModelForMultipleChoice.from_pretrained(model_path)
                     model.to(device)
